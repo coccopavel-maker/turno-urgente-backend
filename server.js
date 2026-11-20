@@ -1,77 +1,189 @@
-// Turno Urgente — backend de notificaciones
-// Recibe eventos (oferta enviada / aceptada / rechazada) desde la app y:
-//   1. Manda un email real via Resend.
-//   2. Si el destinatario activo notificaciones push en su movil, le manda
-//      tambien un push real via Web Push (VAPID).
-//
-// Variables de entorno necesarias (se configuran en el panel de tu hosting,
-// nunca se escriben aqui ni se suben a git):
-//   RESEND_API_KEY   -> tu clave de Resend (resend.com)
-//   FROM_EMAIL       -> remitente verificado, ej: "Turno Urgente <notificaciones@tudominio.com>"
-//   APP_SECRET       -> contraseña simple compartida con la app para frenar abuso
-//   ALLOWED_ORIGIN   -> (opcional) origen desde el que se permite llamar a este backend
-//   VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY -> claves para Web Push (ver README)
-//   VAPID_CONTACT_EMAIL -> un email de contacto tuyo, lo exige el estandar Web Push
-
 import express from 'express';
 import cors from 'cors';
-import webpush from 'web-push';
 import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import webpush from 'web-push';
 
-const app = express();
-app.use(express.json());
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const PORT = process.env.PORT || 10000;
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL = process.env.FROM_EMAIL || 'Turno Urgente <onboarding@resend.dev>';
 const APP_SECRET = process.env.APP_SECRET || '';
-
-const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const VAPID_CONTACT_EMAIL = process.env.VAPID_CONTACT_EMAIL || 'mailto:hola@hostalconnect.es';
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   webpush.setVapidDetails(VAPID_CONTACT_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 }
 
-// --- almacen de suscripciones push -----------------------------------------
-// MVP: un archivo JSON en disco. Suficiente para validar con tus primeros
-// usuarios. Cuando tengas base de datos real (Postgres, ver tu roadmap),
-// sustituye estas dos funciones por lecturas/escrituras a esa base de datos.
-const SUBS_FILE = './subscriptions.json';
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+
+/* ---------------- almacenamiento en disco (archivo JSON) ---------------- */
+
+const DB_PATH = path.join(__dirname, 'db.json');
+const SUBS_PATH = path.join(__dirname, 'subscriptions.json');
+
+function loadJSON(filePath, fallback) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    return raw ? JSON.parse(raw) : fallback;
+  } catch (e) {
+    console.error('Error leyendo', filePath, e);
+    return fallback;
+  }
+}
+
+function saveJSON(filePath, data) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('Error guardando', filePath, e);
+  }
+}
+
+function loadDB() {
+  return loadJSON(DB_PATH, { profiles: {}, availability: {}, offers: {}, notifications: [] });
+}
+function saveDB(db) {
+  saveJSON(DB_PATH, db);
+}
 
 function loadSubs() {
-  try { return JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8')); }
-  catch (e) { return {}; } // { "email@x.com": [subscription, ...] }
+  return loadJSON(SUBS_PATH, {});
 }
 function saveSubs(subs) {
-  fs.writeFileSync(SUBS_FILE, JSON.stringify(subs, null, 2));
+  saveJSON(SUBS_PATH, subs);
 }
 
 function checkSecret(req, res) {
   if (!APP_SECRET) return true;
-  if (req.headers['x-app-secret'] !== APP_SECRET) {
-    res.status(401).json({ ok: false, error: 'No autorizado' });
+  const got = req.header('x-app-secret');
+  if (got !== APP_SECRET) {
+    res.status(401).json({ error: 'secreto invalido' });
     return false;
   }
   return true;
 }
 
+/* ---------------- salud ---------------- */
+
 app.get('/', (req, res) => {
-  res.send('Turno Urgente notify service — OK');
+  res.send('ok - turno urgente backend vivo');
 });
 
-// El navegador del trabajador llama aqui tras pedir permiso de notificaciones.
+/* ---------------- perfiles ---------------- */
+
+app.post('/profiles', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const profile = req.body;
+  if (!profile || !profile.id) return res.status(400).json({ error: 'falta id' });
+  const db = loadDB();
+  db.profiles[profile.id] = profile;
+  saveDB(db);
+  res.json(profile);
+});
+
+app.get('/profiles/:id', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const db = loadDB();
+  const p = db.profiles[req.params.id];
+  if (!p) return res.status(404).json({ error: 'no encontrado' });
+  res.json(p);
+});
+
+/* ---------------- disponibilidad ---------------- */
+
+app.post('/availability/:workerId', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const db = loadDB();
+  db.availability[req.params.workerId] = req.body;
+  saveDB(db);
+  res.json(req.body);
+});
+
+app.get('/availability/:workerId', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const db = loadDB();
+  res.json(db.availability[req.params.workerId] || null);
+});
+
+app.get('/availability', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const db = loadDB();
+  res.json(Object.values(db.availability));
+});
+
+/* ---------------- ofertas ---------------- */
+
+app.post('/offers', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const offer = req.body;
+  if (!offer || !offer.id) return res.status(400).json({ error: 'falta id' });
+  const db = loadDB();
+  db.offers[offer.id] = offer;
+  saveDB(db);
+  res.json(offer);
+});
+
+app.get('/offers', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const db = loadDB();
+  let list = Object.values(db.offers);
+  if (req.query.workerId) list = list.filter(o => o.workerId === req.query.workerId);
+  if (req.query.hosteleroId) list = list.filter(o => o.hosteleroId === req.query.hosteleroId);
+  list.sort((a, b) => b.createdAt - a.createdAt);
+  res.json(list);
+});
+
+app.patch('/offers/:id', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const db = loadDB();
+  const existing = db.offers[req.params.id];
+  if (!existing) return res.status(404).json({ error: 'no encontrada' });
+  const updated = Object.assign({}, existing, req.body);
+  db.offers[req.params.id] = updated;
+  saveDB(db);
+  res.json(updated);
+});
+
+/* ---------------- notificaciones internas (campana en la app) ---------------- */
+
+app.post('/notifications', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const n = req.body;
+  if (!n || !n.id) return res.status(400).json({ error: 'falta id' });
+  const db = loadDB();
+  db.notifications.push(n);
+  if (db.notifications.length > 500) db.notifications = db.notifications.slice(-500);
+  saveDB(db);
+  res.json(n);
+});
+
+app.get('/notifications', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const db = loadDB();
+  let list = db.notifications;
+  if (req.query.para) list = list.filter(n => n.para === req.query.para);
+  list = list.slice().sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
+  res.json(list);
+});
+
+/* ---------------- push subscriptions ---------------- */
+
 app.post('/subscribe', (req, res) => {
   if (!checkSecret(req, res)) return;
   const { email, subscription } = req.body || {};
-  if (!email || !subscription) {
-    return res.status(400).json({ ok: false, error: 'Faltan campos: email, subscription' });
-  }
+  if (!email || !subscription) return res.status(400).json({ error: 'faltan datos' });
   const subs = loadSubs();
-  subs[email] = subs[email] || [];
-  const already = subs[email].some(s => s.endpoint === subscription.endpoint);
-  if (!already) subs[email].push(subscription);
+  if (!subs[email]) subs[email] = [];
+  const exists = subs[email].some(s => s.endpoint === subscription.endpoint);
+  if (!exists) subs[email].push(subscription);
   saveSubs(subs);
   res.json({ ok: true });
 });
@@ -79,6 +191,7 @@ app.post('/subscribe', (req, res) => {
 app.post('/unsubscribe', (req, res) => {
   if (!checkSecret(req, res)) return;
   const { email, endpoint } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'falta email' });
   const subs = loadSubs();
   if (subs[email]) {
     subs[email] = subs[email].filter(s => s.endpoint !== endpoint);
@@ -87,64 +200,67 @@ app.post('/unsubscribe', (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------------- envio real: email (Resend) + push ---------------- */
+
+async function sendEmail(to, subject, body) {
+  if (!RESEND_API_KEY) {
+    console.warn('RESEND_API_KEY no configurada, no se envia email');
+    return;
+  }
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: FROM_EMAIL,
+        to: [to],
+        subject,
+        text: body,
+      }),
+    });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '');
+      console.error('Resend error', resp.status, t);
+    }
+  } catch (e) {
+    console.error('Error enviando email', e);
+  }
+}
+
+async function sendPush(email, subject, body) {
+  const subs = loadSubs();
+  const list = subs[email] || [];
+  if (!list.length) return;
+  const payload = JSON.stringify({ title: subject, body, url: '/' });
+  const stillValid = [];
+  for (const sub of list) {
+    try {
+      await webpush.sendNotification(sub, payload);
+      stillValid.push(sub);
+    } catch (e) {
+      if (e.statusCode === 404 || e.statusCode === 410) {
+        // suscripcion caducada, se descarta
+      } else {
+        console.error('Error enviando push', e.statusCode, e.message);
+        stillValid.push(sub);
+      }
+    }
+  }
+  subs[email] = stillValid;
+  saveSubs(subs);
+}
+
 app.post('/notify', async (req, res) => {
   if (!checkSecret(req, res)) return;
   const { to, subject, body } = req.body || {};
-  if (!to || !subject || !body) {
-    return res.status(400).json({ ok: false, error: 'Faltan campos: to, subject, body' });
-  }
-
-  const result = { ok: true, email: null, push: null };
-
-  // 1. Email via Resend
-  if (RESEND_API_KEY) {
-    try {
-      const r = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${RESEND_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          from: FROM_EMAIL,
-          to: [to],
-          subject,
-          html: `<div style="font-family:sans-serif;font-size:15px;line-height:1.5;color:#1B1D23;">
-                   <p>${body}</p>
-                   <p style="color:#9296A3;font-size:12px;margin-top:24px;">Turno Urgente · HostalConnect</p>
-                 </div>`,
-        }),
-      });
-      const data = await r.json();
-      result.email = r.ok ? { sent: true, id: data.id } : { sent: false, error: data };
-    } catch (err) {
-      result.email = { sent: false, error: String(err) };
-    }
-  }
-
-  // 2. Push al movil, si el destinatario tiene suscripcion activa
-  if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
-    const subs = loadSubs();
-    const list = subs[to] || [];
-    const payload = JSON.stringify({ title: subject, body });
-    const outcomes = await Promise.all(list.map(async (sub) => {
-      try {
-        await webpush.sendNotification(sub, payload);
-        return { endpoint: sub.endpoint, sent: true };
-      } catch (err) {
-        // 410/404 = la suscripcion ya no es valida (usuario desinstalo, etc.)
-        if (err.statusCode === 410 || err.statusCode === 404) {
-          subs[to] = subs[to].filter(s => s.endpoint !== sub.endpoint);
-          saveSubs(subs);
-        }
-        return { endpoint: sub.endpoint, sent: false, error: err.message };
-      }
-    }));
-    result.push = outcomes;
-  }
-
-  res.json(result);
+  if (!to || !subject) return res.status(400).json({ error: 'faltan datos' });
+  await Promise.all([sendEmail(to, subject, body || ''), sendPush(to, subject, body || '')]);
+  res.json({ ok: true });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Turno Urgente notify service escuchando en puerto ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Turno Urgente backend escuchando en puerto ${PORT}`);
+});
