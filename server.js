@@ -113,11 +113,11 @@ app.post('/auth/register', (req, res) => {
   const email = normEmail(fields.email);
   if (!email || !fields.id || !fields.role) return res.status(400).json({ error: 'faltan datos' });
   if (!password || String(password).length < 6) {
-    return res.status(400).json({ error: 'La contraseÃ±a debe tener al menos 6 caracteres.' });
+    return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
   }
   const db = loadDB();
   const exists = Object.values(db.profiles).some(p => normEmail(p.email) === email);
-  if (exists) return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Inicia sesiÃ³n.' });
+  if (exists) return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Inicia sesión.' });
   const salt = crypto.randomBytes(16).toString('hex');
   const profile = Object.assign({}, fields, {
     email,
@@ -133,7 +133,7 @@ app.post('/auth/login', (req, res) => {
   if (!checkSecret(req, res)) return;
   const email = normEmail((req.body || {}).email);
   const password = (req.body || {}).password;
-  if (!email || !password) return res.status(400).json({ error: 'Escribe tu email y tu contraseÃ±a.' });
+  if (!email || !password) return res.status(400).json({ error: 'Escribe tu email y tu contraseña.' });
   if (tooManyAttempts(email)) {
     return res.status(429).json({ error: 'Demasiados intentos. Espera unos minutos y vuelve a probar.' });
   }
@@ -147,7 +147,7 @@ app.post('/auth/login', (req, res) => {
   }
   if (!ok) {
     noteFailedAttempt(email);
-    return res.status(401).json({ error: 'Email o contraseÃ±a incorrectos.' });
+    return res.status(401).json({ error: 'Email o contraseña incorrectos.' });
   }
   res.json(publicProfile(p));
 });

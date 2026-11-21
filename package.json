@@ -1,13 +1,18 @@
 {
   "name": "turno-urgente-notify",
-  "version": "2.0.0",
-  "description": "Backend de Turno Urgente: datos compartidos (perfiles, disponibilidad, ofertas) + email y push reales",
+  "version": "3.0.0",
+  "description": "Backend de Turno Urgente: PostgreSQL (Neon) + email y push reales",
   "type": "module",
-  "engines": { "node": ">=18" },
-  "scripts": { "start": "node server.js" },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "web-push": "^3.6.7"
+    "web-push": "^3.6.7",
+    "pg": "^8.13.0"
   }
 }
