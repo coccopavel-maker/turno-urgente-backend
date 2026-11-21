@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import webpush from 'web-push';
+import crypto from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -77,37 +78,88 @@ app.get('/', (req, res) => {
   res.send('ok - turno urgente backend vivo');
 });
 
-/* ---------------- perfiles ---------------- */
+/* ---------------- cuentas: registro e inicio de sesion (email + contrasena) ---------------- */
 
-app.post('/profiles', (req, res) => {
+function hashPassword(password, salt) {
+  return crypto.scryptSync(String(password), salt, 64).toString('hex');
+}
+
+function publicProfile(p) {
+  const { passwordHash, passwordSalt, ...rest } = p;
+  return rest;
+}
+
+function normEmail(e) {
+  return String(e || '').trim().toLowerCase();
+}
+
+/* limite sencillo de intentos de login: 10 cada 15 minutos por email */
+const loginAttempts = new Map();
+function tooManyAttempts(email) {
+  const now = Date.now();
+  const list = (loginAttempts.get(email) || []).filter(t => now - t < 15 * 60 * 1000);
+  loginAttempts.set(email, list);
+  return list.length >= 10;
+}
+function noteFailedAttempt(email) {
+  const list = loginAttempts.get(email) || [];
+  list.push(Date.now());
+  loginAttempts.set(email, list);
+}
+
+app.post('/auth/register', (req, res) => {
   if (!checkSecret(req, res)) return;
-  const profile = req.body;
-  if (!profile || !profile.id) return res.status(400).json({ error: 'falta id' });
+  const { password, ...fields } = req.body || {};
+  const email = normEmail(fields.email);
+  if (!email || !fields.id || !fields.role) return res.status(400).json({ error: 'faltan datos' });
+  if (!password || String(password).length < 6) {
+    return res.status(400).json({ error: 'La contraseÃ±a debe tener al menos 6 caracteres.' });
+  }
   const db = loadDB();
+  const exists = Object.values(db.profiles).some(p => normEmail(p.email) === email);
+  if (exists) return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Inicia sesiÃ³n.' });
+  const salt = crypto.randomBytes(16).toString('hex');
+  const profile = Object.assign({}, fields, {
+    email,
+    passwordSalt: salt,
+    passwordHash: hashPassword(password, salt),
+  });
   db.profiles[profile.id] = profile;
   saveDB(db);
-  res.json(profile);
+  res.json(publicProfile(profile));
 });
+
+app.post('/auth/login', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const email = normEmail((req.body || {}).email);
+  const password = (req.body || {}).password;
+  if (!email || !password) return res.status(400).json({ error: 'Escribe tu email y tu contraseÃ±a.' });
+  if (tooManyAttempts(email)) {
+    return res.status(429).json({ error: 'Demasiados intentos. Espera unos minutos y vuelve a probar.' });
+  }
+  const db = loadDB();
+  const p = Object.values(db.profiles).find(x => normEmail(x.email) === email);
+  let ok = false;
+  if (p && p.passwordHash && p.passwordSalt) {
+    const a = Buffer.from(hashPassword(password, p.passwordSalt), 'hex');
+    const b = Buffer.from(p.passwordHash, 'hex');
+    ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
+  if (!ok) {
+    noteFailedAttempt(email);
+    return res.status(401).json({ error: 'Email o contraseÃ±a incorrectos.' });
+  }
+  res.json(publicProfile(p));
+});
+
+/* ---------------- perfiles ---------------- */
 
 app.get('/profiles/:id', (req, res) => {
   if (!checkSecret(req, res)) return;
   const db = loadDB();
   const p = db.profiles[req.params.id];
   if (!p) return res.status(404).json({ error: 'no encontrado' });
-  res.json(p);
-});
-
-/* busca un perfil existente por email + rol, para "iniciar sesion" sin contrasena */
-app.get('/profiles', (req, res) => {
-  if (!checkSecret(req, res)) return;
-  const db = loadDB();
-  let list = Object.values(db.profiles);
-  if (req.query.email) {
-    const email = String(req.query.email).trim().toLowerCase();
-    list = list.filter(p => (p.email || '').trim().toLowerCase() === email);
-  }
-  if (req.query.role) list = list.filter(p => p.role === req.query.role);
-  res.json(list);
+  res.json(publicProfile(p));
 });
 
 /* ---------------- disponibilidad ---------------- */
