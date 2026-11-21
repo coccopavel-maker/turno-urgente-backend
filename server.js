@@ -1,14 +1,11 @@
 import express from 'express';
 import cors from 'cors';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import pg from 'pg';
 import webpush from 'web-push';
 import crypto from 'crypto';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 const PORT = process.env.PORT || 10000;
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL = process.env.FROM_EMAIL || 'Turno Urgente <onboarding@resend.dev>';
 const APP_SECRET = process.env.APP_SECRET || '';
@@ -24,43 +21,60 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-/* ---------------- almacenamiento en disco (archivo JSON) ---------------- */
+/* ---------------- almacenamiento: base de datos PostgreSQL (Neon) ---------------- */
 
-const DB_PATH = path.join(__dirname, 'db.json');
-const SUBS_PATH = path.join(__dirname, 'subscriptions.json');
-
-function loadJSON(filePath, fallback) {
-  try {
-    if (!fs.existsSync(filePath)) return fallback;
-    const raw = fs.readFileSync(filePath, 'utf8');
-    return raw ? JSON.parse(raw) : fallback;
-  } catch (e) {
-    console.error('Error leyendo', filePath, e);
-    return fallback;
-  }
+if (!DATABASE_URL) {
+  console.error('FALTA la variable DATABASE_URL (la direccion de conexion de Neon). El servidor no puede arrancar sin ella.');
+  process.exit(1);
 }
 
-function saveJSON(filePath, data) {
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error('Error guardando', filePath, e);
-  }
+const pool = new pg.Pool({
+  connectionString: DATABASE_URL,
+  ssl: /localhost|127\.0\.0\.1/.test(DATABASE_URL) ? false : { rejectUnauthorized: false },
+  max: 5,
+});
+pool.on('error', e => console.error('Error en la conexion a la base de datos', e.message));
+
+/* una sola tabla: cada fila es un documento JSON dentro de una coleccion */
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS kv (
+      collection text NOT NULL,
+      id text NOT NULL,
+      data jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (collection, id)
+    )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS kv_email_idx ON kv (collection, lower(data->>'email'))`);
 }
 
-function loadDB() {
-  return loadJSON(DB_PATH, { profiles: {}, availability: {}, offers: {}, notifications: [] });
+async function dbGet(collection, id) {
+  const r = await pool.query('SELECT data FROM kv WHERE collection=$1 AND id=$2', [collection, id]);
+  return r.rows[0] ? r.rows[0].data : null;
 }
-function saveDB(db) {
-  saveJSON(DB_PATH, db);
+async function dbPut(collection, id, data) {
+  await pool.query(
+    `INSERT INTO kv (collection, id, data) VALUES ($1,$2,$3)
+     ON CONFLICT (collection, id) DO UPDATE SET data = EXCLUDED.data`,
+    [collection, id, JSON.stringify(data)]
+  );
+  return data;
+}
+async function dbAll(collection) {
+  const r = await pool.query('SELECT data FROM kv WHERE collection=$1', [collection]);
+  return r.rows.map(x => x.data);
+}
+async function dbFindByEmail(collection, email) {
+  const r = await pool.query(
+    `SELECT data FROM kv WHERE collection=$1 AND lower(data->>'email')=$2 LIMIT 1`, [collection, email]);
+  return r.rows[0] ? r.rows[0].data : null;
 }
 
-function loadSubs() {
-  return loadJSON(SUBS_PATH, {});
-}
-function saveSubs(subs) {
-  saveJSON(SUBS_PATH, subs);
-}
+/* envuelve las rutas async para que un error devuelva 500 en vez de tumbar el servidor */
+const h = fn => (req, res) => Promise.resolve(fn(req, res)).catch(e => {
+  console.error('Error en', req.method, req.path, e);
+  if (!res.headersSent) res.status(500).json({ error: 'error interno' });
+});
 
 function checkSecret(req, res) {
   if (!APP_SECRET) return true;
@@ -71,12 +85,6 @@ function checkSecret(req, res) {
   }
   return true;
 }
-
-/* ---------------- salud ---------------- */
-
-app.get('/', (req, res) => {
-  res.send('ok - turno urgente backend vivo');
-});
 
 /* ---------------- cuentas: registro e inicio de sesion (email + contrasena) ---------------- */
 
@@ -107,7 +115,14 @@ function noteFailedAttempt(email) {
   loginAttempts.set(email, list);
 }
 
-app.post('/auth/register', (req, res) => {
+/* ---------------- salud ---------------- */
+
+app.get('/', h(async (req, res) => {
+  await pool.query('SELECT 1');
+  res.send('ok - turno urgente backend vivo (base de datos conectada)');
+}));
+
+app.post('/auth/register', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
   const { password, ...fields } = req.body || {};
   const email = normEmail(fields.email);
@@ -115,8 +130,7 @@ app.post('/auth/register', (req, res) => {
   if (!password || String(password).length < 6) {
     return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
   }
-  const db = loadDB();
-  const exists = Object.values(db.profiles).some(p => normEmail(p.email) === email);
+  const exists = await dbFindByEmail('profiles', email);
   if (exists) return res.status(409).json({ error: 'Ya existe una cuenta con ese email. Inicia sesión.' });
   const salt = crypto.randomBytes(16).toString('hex');
   const profile = Object.assign({}, fields, {
@@ -124,12 +138,11 @@ app.post('/auth/register', (req, res) => {
     passwordSalt: salt,
     passwordHash: hashPassword(password, salt),
   });
-  db.profiles[profile.id] = profile;
-  saveDB(db);
+  await dbPut('profiles', String(profile.id), profile);
   res.json(publicProfile(profile));
-});
+}));
 
-app.post('/auth/login', (req, res) => {
+app.post('/auth/login', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
   const email = normEmail((req.body || {}).email);
   const password = (req.body || {}).password;
@@ -137,8 +150,7 @@ app.post('/auth/login', (req, res) => {
   if (tooManyAttempts(email)) {
     return res.status(429).json({ error: 'Demasiados intentos. Espera unos minutos y vuelve a probar.' });
   }
-  const db = loadDB();
-  const p = Object.values(db.profiles).find(x => normEmail(x.email) === email);
+  const p = await dbFindByEmail('profiles', email);
   let ok = false;
   if (p && p.passwordHash && p.passwordSalt) {
     const a = Buffer.from(hashPassword(password, p.passwordSalt), 'hex');
@@ -150,120 +162,104 @@ app.post('/auth/login', (req, res) => {
     return res.status(401).json({ error: 'Email o contraseña incorrectos.' });
   }
   res.json(publicProfile(p));
-});
+}));
 
 /* ---------------- perfiles ---------------- */
 
-app.get('/profiles/:id', (req, res) => {
+app.get('/profiles/:id', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
-  const db = loadDB();
-  const p = db.profiles[req.params.id];
+  const p = await dbGet('profiles', req.params.id);
   if (!p) return res.status(404).json({ error: 'no encontrado' });
   res.json(publicProfile(p));
-});
+}));
 
 /* ---------------- disponibilidad ---------------- */
 
-app.post('/availability/:workerId', (req, res) => {
+app.post('/availability/:workerId', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
-  const db = loadDB();
-  db.availability[req.params.workerId] = req.body;
-  saveDB(db);
+  await dbPut('availability', req.params.workerId, req.body);
   res.json(req.body);
-});
+}));
 
-app.get('/availability/:workerId', (req, res) => {
+app.get('/availability/:workerId', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
-  const db = loadDB();
-  res.json(db.availability[req.params.workerId] || null);
-});
+  res.json(await dbGet('availability', req.params.workerId));
+}));
 
-app.get('/availability', (req, res) => {
+app.get('/availability', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
-  const db = loadDB();
-  res.json(Object.values(db.availability));
-});
+  res.json(await dbAll('availability'));
+}));
 
 /* ---------------- ofertas ---------------- */
 
-app.post('/offers', (req, res) => {
+app.post('/offers', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
   const offer = req.body;
   if (!offer || !offer.id) return res.status(400).json({ error: 'falta id' });
-  const db = loadDB();
-  db.offers[offer.id] = offer;
-  saveDB(db);
+  await dbPut('offers', String(offer.id), offer);
   res.json(offer);
-});
+}));
 
-app.get('/offers', (req, res) => {
+app.get('/offers', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
-  const db = loadDB();
-  let list = Object.values(db.offers);
+  let list = await dbAll('offers');
   if (req.query.workerId) list = list.filter(o => o.workerId === req.query.workerId);
   if (req.query.hosteleroId) list = list.filter(o => o.hosteleroId === req.query.hosteleroId);
   list.sort((a, b) => b.createdAt - a.createdAt);
   res.json(list);
-});
+}));
 
-app.patch('/offers/:id', (req, res) => {
+app.patch('/offers/:id', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
-  const db = loadDB();
-  const existing = db.offers[req.params.id];
+  const existing = await dbGet('offers', req.params.id);
   if (!existing) return res.status(404).json({ error: 'no encontrada' });
   const updated = Object.assign({}, existing, req.body);
-  db.offers[req.params.id] = updated;
-  saveDB(db);
+  await dbPut('offers', req.params.id, updated);
   res.json(updated);
-});
+}));
 
 /* ---------------- notificaciones internas (campana en la app) ---------------- */
 
-app.post('/notifications', (req, res) => {
+app.post('/notifications', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
   const n = req.body;
   if (!n || !n.id) return res.status(400).json({ error: 'falta id' });
-  const db = loadDB();
-  db.notifications.push(n);
-  if (db.notifications.length > 500) db.notifications = db.notifications.slice(-500);
-  saveDB(db);
+  await dbPut('notifications', String(n.id), n);
   res.json(n);
-});
+}));
 
-app.get('/notifications', (req, res) => {
+app.get('/notifications', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
-  const db = loadDB();
-  let list = db.notifications;
-  if (req.query.para) list = list.filter(n => n.para === req.query.para);
-  list = list.slice().sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
-  res.json(list);
-});
+  const para = req.query.para ? String(req.query.para) : null;
+  const r = await pool.query(
+    `SELECT data FROM kv WHERE collection='notifications' AND ($1::text IS NULL OR data->>'para' = $1)
+     ORDER BY (data->>'createdAt')::bigint DESC LIMIT 5`, [para]);
+  res.json(r.rows.map(x => x.data));
+}));
 
 /* ---------------- push subscriptions ---------------- */
 
-app.post('/subscribe', (req, res) => {
+app.post('/subscribe', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
   const { email, subscription } = req.body || {};
   if (!email || !subscription) return res.status(400).json({ error: 'faltan datos' });
-  const subs = loadSubs();
-  if (!subs[email]) subs[email] = [];
-  const exists = subs[email].some(s => s.endpoint === subscription.endpoint);
-  if (!exists) subs[email].push(subscription);
-  saveSubs(subs);
+  const key = normEmail(email);
+  const list = (await dbGet('subs', key)) || [];
+  if (!list.some(s => s.endpoint === subscription.endpoint)) list.push(subscription);
+  await dbPut('subs', key, list);
   res.json({ ok: true });
-});
+}));
 
-app.post('/unsubscribe', (req, res) => {
+app.post('/unsubscribe', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
   const { email, endpoint } = req.body || {};
   if (!email) return res.status(400).json({ error: 'falta email' });
-  const subs = loadSubs();
-  if (subs[email]) {
-    subs[email] = subs[email].filter(s => s.endpoint !== endpoint);
-    saveSubs(subs);
-  }
+  const key = normEmail(email);
+  const list = (await dbGet('subs', key)) || [];
+  await dbPut('subs', key, list.filter(s => s.endpoint !== endpoint));
   res.json({ ok: true });
-});
+}));
 
 /* ---------------- envio real: email (Resend) + push ---------------- */
 
@@ -296,8 +292,8 @@ async function sendEmail(to, subject, body) {
 }
 
 async function sendPush(email, subject, body) {
-  const subs = loadSubs();
-  const list = subs[email] || [];
+  const key = normEmail(email);
+  const list = (await dbGet('subs', key)) || [];
   if (!list.length) return;
   const payload = JSON.stringify({ title: subject, body, url: '/' });
   const stillValid = [];
@@ -314,18 +310,24 @@ async function sendPush(email, subject, body) {
       }
     }
   }
-  subs[email] = stillValid;
-  saveSubs(subs);
+  await dbPut('subs', key, stillValid);
 }
 
-app.post('/notify', async (req, res) => {
+app.post('/notify', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
   const { to, subject, body } = req.body || {};
   if (!to || !subject) return res.status(400).json({ error: 'faltan datos' });
   await Promise.all([sendEmail(to, subject, body || ''), sendPush(to, subject, body || '')]);
   res.json({ ok: true });
-});
+}));
 
-app.listen(PORT, () => {
-  console.log(`Turno Urgente backend escuchando en puerto ${PORT}`);
-});
+initDB()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Turno Urgente backend escuchando en puerto ${PORT} (base de datos conectada)`);
+    });
+  })
+  .catch(e => {
+    console.error('No se pudo conectar con la base de datos:', e.message);
+    process.exit(1);
+  });
