@@ -97,6 +97,19 @@ app.get('/profiles/:id', (req, res) => {
   res.json(p);
 });
 
+/* busca un perfil existente por email + rol, para "iniciar sesion" sin contrasena */
+app.get('/profiles', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const db = loadDB();
+  let list = Object.values(db.profiles);
+  if (req.query.email) {
+    const email = String(req.query.email).trim().toLowerCase();
+    list = list.filter(p => (p.email || '').trim().toLowerCase() === email);
+  }
+  if (req.query.role) list = list.filter(p => p.role === req.query.role);
+  res.json(list);
+});
+
 /* ---------------- disponibilidad ---------------- */
 
 app.post('/availability/:workerId', (req, res) => {
@@ -263,4 +276,3 @@ app.post('/notify', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Turno Urgente backend escuchando en puerto ${PORT}`);
-});
