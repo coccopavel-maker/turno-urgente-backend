@@ -11,6 +11,7 @@ const FROM_EMAIL = process.env.FROM_EMAIL || 'Turno Urgente <onboarding@resend.d
 const APP_SECRET = process.env.APP_SECRET || '';
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const APP_URL = (process.env.APP_URL || 'https://mellow-marshmallow-47a8ae.netlify.app').replace(/\/$/, '');
 const VAPID_CONTACT_EMAIL = process.env.VAPID_CONTACT_EMAIL || 'mailto:hola@hostalconnect.es';
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
@@ -233,6 +234,7 @@ app.post('/ratings', h(async (req, res) => {
   const offer = offerId ? await dbGet('offers', String(offerId)) : null;
   if (!offer) return res.status(404).json({ error: 'turno no encontrado' });
   if (offer.status !== 'aceptada') return res.status(400).json({ error: 'Solo se pueden valorar turnos aceptados.' });
+  if (offer.endsAt && Date.now() < offer.endsAt) return res.status(400).json({ error: 'El turno aún no ha terminado.' });
   let toId, fromRole, fromNombre;
   if (fromId === offer.workerId) { toId = offer.hosteleroId; fromRole = 'trabajador'; fromNombre = offer.workerNombre; }
   else if (fromId === offer.hosteleroId) { toId = offer.workerId; fromRole = 'hostelero'; fromNombre = offer.local || offer.hosteleroNombre; }
@@ -359,11 +361,11 @@ async function sendEmail(to, subject, body) {
   }
 }
 
-async function sendPush(email, subject, body) {
+async function sendPush(email, subject, body, url) {
   const key = normEmail(email);
   const list = (await dbGet('subs', key)) || [];
   if (!list.length) return;
-  const payload = JSON.stringify({ title: subject, body, url: '/' });
+  const payload = JSON.stringify({ title: subject, body, url: url || '/' });
   const stillValid = [];
   for (const sub of list) {
     try {
@@ -413,10 +415,14 @@ async function checkShiftEnds() {
         if (!prof || !prof.email) continue;
         const asunto = 'Ha terminado el turno: valóralo';
         const cuerpo = `El turno con ${who.otro} (${o.desde}–${o.hasta}) ha terminado. Entra en Turno Urgente y deja tu valoración: son 10 segundos y ayuda a toda la comunidad.`;
+        const enlace = `${APP_URL}/?valorar=${encodeURIComponent(o.id)}`;
         await dbPut('notifications', 'fin-' + o.id + '-' + who.id, {
           id: 'fin-' + o.id + '-' + who.id, para: prof.email, asunto, cuerpo, createdAt: Date.now(), leida: false,
         });
-        await Promise.all([sendEmail(prof.email, asunto, cuerpo), sendPush(prof.email, asunto, cuerpo)]);
+        await Promise.all([
+          sendEmail(prof.email, asunto, cuerpo + '\n\nValorar ahora: ' + enlace),
+          sendPush(prof.email, asunto, cuerpo, enlace),
+        ]);
       }
     }
   } catch (e) {
