@@ -360,6 +360,8 @@ async function sendEmail(to, subject, body) {
     if (!resp.ok) {
       const t = await resp.text().catch(() => '');
       console.error('Resend error', resp.status, t);
+    } else {
+      console.log('Email enviado a', to, '-', subject);
     }
   } catch (e) {
     console.error('Error enviando email', e);
@@ -403,6 +405,7 @@ app.post('/notify', h(async (req, res) => {
 let nextEnd = null;
 function noteShiftEnd(o) {
   if (o && o.status === 'aceptada' && o.endsAt && !o.endNotified) {
+    console.log('Turno aceptado, aviso programado para', new Date(o.endsAt).toISOString());
     if (nextEnd === null || o.endsAt < nextEnd) nextEnd = o.endsAt;
   }
 }
@@ -425,6 +428,7 @@ async function checkShiftEnds() {
     const offers = await dbAll('offers');
     for (const o of offers) {
       if (o.status !== 'aceptada' || !o.endsAt || o.endsAt > now || o.endNotified) continue;
+      console.log('Fin de turno detectado, oferta', o.id);
       /* se marca antes de avisar para no mandar el aviso dos veces */
       await dbPut('offers', String(o.id), Object.assign({}, o, { endNotified: true }));
       const people = [
