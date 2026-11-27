@@ -219,6 +219,74 @@ app.patch('/offers/:id', h(async (req, res) => {
   res.json(updated);
 }));
 
+/* ---------------- valoraciones (despues del turno, en las dos direcciones) ---------------- */
+
+/* 5 preguntas, cada una de 1 a 5 estrellas. Distintas segun quien valora. */
+const CRITERIOS = {
+  hostelero: ['puntualidad', 'profesionalidad', 'trato', 'rapidez', 'actitud'],   /* el hostelero valora al trabajador */
+  trabajador: ['pago', 'turno', 'trato', 'organizacion', 'ambiente'],            /* el trabajador valora al local */
+};
+
+app.post('/ratings', h(async (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const { offerId, fromId, scores, comment } = req.body || {};
+  const offer = offerId ? await dbGet('offers', String(offerId)) : null;
+  if (!offer) return res.status(404).json({ error: 'turno no encontrado' });
+  if (offer.status !== 'aceptada') return res.status(400).json({ error: 'Solo se pueden valorar turnos aceptados.' });
+  let toId, fromRole, fromNombre;
+  if (fromId === offer.workerId) { toId = offer.hosteleroId; fromRole = 'trabajador'; fromNombre = offer.workerNombre; }
+  else if (fromId === offer.hosteleroId) { toId = offer.workerId; fromRole = 'hostelero'; fromNombre = offer.local || offer.hosteleroNombre; }
+  else return res.status(403).json({ error: 'No participaste en este turno.' });
+  const clean = {};
+  for (const k of CRITERIOS[fromRole]) {
+    const n = Number((scores || {})[k]);
+    if (!Number.isInteger(n) || n < 1 || n > 5) return res.status(400).json({ error: 'Puntúa las 5 preguntas de 1 a 5 estrellas.' });
+    clean[k] = n;
+  }
+  const id = offer.id + ':' + fromId;
+  if (await dbGet('ratings', id)) return res.status(409).json({ error: 'Ya valoraste este turno.' });
+  const vals = Object.values(clean);
+  const rating = {
+    id, offerId: offer.id, fromId, toId, fromRole, fromNombre,
+    scores: clean, stars: Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10,
+    comment: String(comment || '').trim().slice(0, 200), createdAt: Date.now(),
+  };
+  await dbPut('ratings', id, rating);
+  res.json(rating);
+}));
+
+app.get('/ratings', h(async (req, res) => {
+  if (!checkSecret(req, res)) return;
+  let list = await dbAll('ratings');
+  if (req.query.fromId) list = list.filter(r => r.fromId === req.query.fromId);
+  if (req.query.toId) list = list.filter(r => r.toId === req.query.toId);
+  list.sort((a, b) => b.createdAt - a.createdAt);
+  res.json(list);
+}));
+
+app.get('/ratings/summary', h(async (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const list = await dbAll('ratings');
+  list.sort((a, b) => b.createdAt - a.createdAt);
+  const acc = {};
+  for (const r of list) {
+    const o = acc[r.toId] || (acc[r.toId] = { sum: 0, count: 0, crit: {}, last: null });
+    o.sum += r.stars; o.count += 1;
+    for (const [k, v] of Object.entries(r.scores || {})) {
+      const c = o.crit[k] || (o.crit[k] = { sum: 0, n: 0 });
+      c.sum += v; c.n += 1;
+    }
+    if (!o.last && r.comment) o.last = { comment: r.comment, from: r.fromNombre };
+  }
+  const out = {};
+  for (const [id, o] of Object.entries(acc)) {
+    const crit = {};
+    for (const [k, c] of Object.entries(o.crit)) crit[k] = Math.round((c.sum / c.n) * 10) / 10;
+    out[id] = { avg: Math.round((o.sum / o.count) * 10) / 10, count: o.count, crit, last: o.last };
+  }
+  res.json(out);
+}));
+
 /* ---------------- notificaciones internas (campana en la app) ---------------- */
 
 app.post('/notifications', h(async (req, res) => {
@@ -321,10 +389,49 @@ app.post('/notify', h(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/* ---------------- aviso automatico al terminar el turno (para valorarlo) ---------------- */
+
+let checkingEnds = false;
+async function checkShiftEnds() {
+  if (checkingEnds) return;
+  checkingEnds = true;
+  try {
+    const now = Date.now();
+    const offers = await dbAll('offers');
+    for (const o of offers) {
+      if (o.status !== 'aceptada' || !o.endsAt || o.endsAt > now || o.endNotified) continue;
+      /* se marca antes de avisar para no mandar el aviso dos veces */
+      await dbPut('offers', String(o.id), Object.assign({}, o, { endNotified: true }));
+      const people = [
+        { id: o.workerId, otro: o.local || 'el local' },
+        { id: o.hosteleroId, otro: o.workerNombre || 'tu trabajador' },
+      ];
+      for (const who of people) {
+        if (!who.id) continue;
+        if (await dbGet('ratings', o.id + ':' + who.id)) continue; /* ya lo valoro */
+        const prof = await dbGet('profiles', String(who.id));
+        if (!prof || !prof.email) continue;
+        const asunto = 'Ha terminado el turno: valóralo';
+        const cuerpo = `El turno con ${who.otro} (${o.desde}–${o.hasta}) ha terminado. Entra en Turno Urgente y deja tu valoración: son 10 segundos y ayuda a toda la comunidad.`;
+        await dbPut('notifications', 'fin-' + o.id + '-' + who.id, {
+          id: 'fin-' + o.id + '-' + who.id, para: prof.email, asunto, cuerpo, createdAt: Date.now(), leida: false,
+        });
+        await Promise.all([sendEmail(prof.email, asunto, cuerpo), sendPush(prof.email, asunto, cuerpo)]);
+      }
+    }
+  } catch (e) {
+    console.error('Error comprobando fin de turnos', e);
+  } finally {
+    checkingEnds = false;
+  }
+}
+
 initDB()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Turno Urgente backend escuchando en puerto ${PORT} (base de datos conectada)`);
+      checkShiftEnds();
+      setInterval(checkShiftEnds, 60 * 1000);
     });
   })
   .catch(e => {
