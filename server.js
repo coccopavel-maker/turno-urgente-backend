@@ -123,6 +123,9 @@ app.get('/', h(async (req, res) => {
   res.send('ok - turno urgente backend vivo (base de datos conectada)');
 }));
 
+/* para el vigilante externo (UptimeRobot): no toca la base de datos, asi Neon puede dormir */
+app.get('/ping', (req, res) => res.send('ok'));
+
 app.post('/auth/register', h(async (req, res) => {
   if (!checkSecret(req, res)) return;
   const { password, ...fields } = req.body || {};
@@ -199,6 +202,7 @@ app.post('/offers', h(async (req, res) => {
   const offer = req.body;
   if (!offer || !offer.id) return res.status(400).json({ error: 'falta id' });
   await dbPut('offers', String(offer.id), offer);
+  noteShiftEnd(offer);
   res.json(offer);
 }));
 
@@ -217,6 +221,7 @@ app.patch('/offers/:id', h(async (req, res) => {
   if (!existing) return res.status(404).json({ error: 'no encontrada' });
   const updated = Object.assign({}, existing, req.body);
   await dbPut('offers', req.params.id, updated);
+  noteShiftEnd(updated);
   res.json(updated);
 }));
 
@@ -393,6 +398,24 @@ app.post('/notify', h(async (req, res) => {
 
 /* ---------------- aviso automatico al terminar el turno (para valorarlo) ---------------- */
 
+/* Se recuerda en memoria cuando acaba el proximo turno, y solo se consulta la base de datos
+   cuando llega esa hora. Asi la base de datos (Neon) puede dormirse mientras nadie usa la app. */
+let nextEnd = null;
+function noteShiftEnd(o) {
+  if (o && o.status === 'aceptada' && o.endsAt && !o.endNotified) {
+    if (nextEnd === null || o.endsAt < nextEnd) nextEnd = o.endsAt;
+  }
+}
+async function refreshNextEnd() {
+  try {
+    const offers = await dbAll('offers');
+    const pend = offers.filter(o => o.status === 'aceptada' && o.endsAt && !o.endNotified).map(o => o.endsAt);
+    nextEnd = pend.length ? Math.min(...pend) : null;
+  } catch (e) {
+    console.error('Error calculando el proximo fin de turno', e);
+  }
+}
+
 let checkingEnds = false;
 async function checkShiftEnds() {
   if (checkingEnds) return;
@@ -436,8 +459,13 @@ initDB()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Turno Urgente backend escuchando en puerto ${PORT} (base de datos conectada)`);
-      checkShiftEnds();
-      setInterval(checkShiftEnds, 60 * 1000);
+      checkShiftEnds().then(refreshNextEnd);
+      setInterval(async () => {
+        if (nextEnd !== null && Date.now() >= nextEnd) {
+          await checkShiftEnds();
+          await refreshNextEnd();
+        }
+      }, 60 * 1000);
     });
   })
   .catch(e => {
